@@ -29,7 +29,6 @@ whisper_hub: "openai/whisper-medium"
 # Whisper specific parameters
 whisper_frozen: False
 keep_n_layers: 6 # keep first N layers from the Transformer Encoder stack inside the whisper model
-
 # Training parameters
 number_of_epochs: 100
 lr: 0.001

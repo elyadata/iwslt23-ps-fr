@@ -3,21 +3,22 @@
     Recipe for fine-tuning a Whisper-Lin-transformer model for Pashto ASR.
 """
 
-import sys
-import torch
 import logging
+import sys
+
 import speechbrain as sb
-from speechbrain.tokenizers.SentencePiece import SentencePiece
-from speechbrain.utils.distributed import run_on_main
+import torch
 from hyperpyyaml import load_hyperpyyaml
 from sacremoses import MosesDetokenizer
+from speechbrain.tokenizers.SentencePiece import SentencePiece
+from speechbrain.utils.distributed import run_on_main
 
 
 # Define training procedure
 class ASR(sb.core.Brain):
     def compute_forward(self, batch, stage):
         """Forward computations from the waveform batches to the output probabilities."""
-        
+
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig  # audio
         tokens_bos, _ = batch.tokens_bos  # transcriptions
@@ -60,6 +61,9 @@ class ASR(sb.core.Brain):
 
         # st loss
         loss = self.hparams.seq_cost(p_seq, tokens_eos, length=tokens_eos_lens)
+
+        if loss.isnan():
+            logger.warning(f"NaN loss found: {loss}")
 
         fr_detokenizer = MosesDetokenizer(lang=self.hparams.lang)
 
@@ -203,7 +207,7 @@ def dataio_prepare(hparams):
     @sb.utils.data_pipeline.provides("sig")
     def audio_pipeline(wav, start, stop, id):
         """Load the audio signal. This is done on the CPU in the `collate_fn`."""
-        
+
         sig = sb.dataio.dataio.read_audio({"start": start, "stop": stop, "file": wav})
         torch.cuda.empty_cache()
         return sig
@@ -315,7 +319,7 @@ def dataio_prepare(hparams):
             )
 
         hparams["dataloader_options"]["shuffle"] = False
-        
+
     elif hparams["sorting"] == "descending":
         # use smaller dataset to debug the model
         if hparams["debug"]:
@@ -340,7 +344,7 @@ def dataio_prepare(hparams):
             )
 
         hparams["dataloader_options"]["shuffle"] = False
-        
+
     elif hparams["sorting"] == "random":
         # use smaller dataset to debug the model
         if hparams["debug"]:
@@ -407,20 +411,22 @@ if __name__ == "__main__":
     # Load datasets for training, valid, and test, trains and applies tokenizer
     datasets, tokenizer = dataio_prepare(hparams)
 
-    # TODO: adapt this to the desired architecture
-    # Before training, we drop some of the wav2vec 2.0 Transformer Encoder layers
-    # asr_brain.modules.whisper.model.encoder.layers = asr_brain.modules.whisper.model.encoder.layers[
-    #     : hparams["keep_n_layers"]
-    # ]
+    # Before training, we drop some of the Whisper Transformer Encoder layers
+    if len(asr_brain.modules.whisper.model.encoder.layers) > hparams["keep_n_layers"]:
+        asr_brain.modules.whisper.model.encoder.layers = asr_brain.modules.whisper.model.encoder.layers[
+            : hparams["keep_n_layers"]
+        ]
+    n_last_layers_kept = hparams["keep_n_layers"]
+    logger.warning(f"Cannot keep the {n_last_layers_kept} last layers of the Whisper encoder since it only has {len(asr_brain.modules.whisper.model.encoder.layers)} layers. Will not drop any layers.")
 
     # Training
     asr_brain.fit(
-        asr_brain.hparams.epoch_counter,
-        datasets["train"],
-        datasets["dev"],
-        train_loader_kwargs=hparams["dataloader_options"],
-        valid_loader_kwargs=hparams["test_dataloader_options"],
-    )
+            asr_brain.hparams.epoch_counter,
+            datasets["train"],
+            datasets["dev"],
+            train_loader_kwargs=hparams["dataloader_options"],
+            valid_loader_kwargs=hparams["test_dataloader_options"],
+        )
 
     # Test
     for dataset in ["dev", "test"]:
