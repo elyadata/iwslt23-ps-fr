@@ -56,7 +56,6 @@ class ASR(sb.core.Brain):
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss given predictions and targets."""
         (p_seq, _, hyps) = predictions
-        ids = batch.id
         tokens_eos, tokens_eos_lens = batch.tokens_eos
 
         # st loss
@@ -65,22 +64,20 @@ class ASR(sb.core.Brain):
         if loss.isnan():
             logger.warning(f"NaN loss found: {loss}")
 
-        fr_detokenizer = MosesDetokenizer(lang=self.hparams.lang)
+        detokenizer = MosesDetokenizer(lang=self.hparams.lang)
 
         if stage != sb.Stage.TRAIN:
             predictions = [
-                fr_detokenizer.detokenize(
+                detokenizer.detokenize(
                     tokenizer.sp.decode_ids(utt_seq).split(" ")
                 )
                 for utt_seq in hyps
             ]
 
             detokenized_transcription = [
-                fr_detokenizer.detokenize(transcription.split(" "))
+                detokenizer.detokenize(transcription.split(" "))
                 for transcription in batch.transcription
             ]
-            # it needs to be a list of list due to the extend on the bleu implementation
-            # targets = [detokenized_transcription]
             
             # tracking error rate
             self.wer_metric.append(batch.id, predictions, detokenized_transcription)

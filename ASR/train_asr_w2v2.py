@@ -54,31 +54,33 @@ class ASR(sb.core.Brain):
 
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss given predictions and targets."""
-        (p_seq, wav_lens, hyps) = predictions
-        ids = batch.id
+        (p_seq, _, hyps) = predictions
         tokens_eos, tokens_eos_lens = batch.tokens_eos
 
-        # st loss
+        # loss
         loss = self.hparams.seq_cost(p_seq, tokens_eos, length=tokens_eos_lens)
-
-        fr_detokenizer = MosesDetokenizer(lang=self.hparams.lang)
+        
+        if loss.isnan():
+            logger.warning(f"NaN loss found: {loss}")
+        
+        detokenizer = MosesDetokenizer(lang=self.hparams.lang)
 
         if stage != sb.Stage.TRAIN:
             predictions = [
-                fr_detokenizer.detokenize(
+                detokenizer.detokenize(
                     tokenizer.sp.decode_ids(utt_seq).split(" ")
                 )
                 for utt_seq in hyps
             ]
 
             detokenized_transcription = [
-                fr_detokenizer.detokenize(transcription.split(" "))
+                detokenizer.detokenize(transcription.split(" "))
                 for transcription in batch.transcription
             ]
-            # it needs to be a list of list due to the extend on the bleu implementation
-            targets = [detokenized_transcription]
 
-            self.bleu_metric.append(ids, predictions, targets)
+            # tracking error rate
+            self.wer_metric.append(batch.id, predictions, detokenized_transcription)
+            self.cer_metric.append(batch.id, predictions, detokenized_transcription)
 
             # compute the accuracy of the one-step-forward prediction
             self.acc_metric.append(p_seq, tokens_eos, tokens_eos_lens)
@@ -126,11 +128,10 @@ class ASR(sb.core.Brain):
 
     def on_stage_start(self, stage, epoch):
         """Gets called when a stage (either training, validation, test) starts."""
-        self.bleu_metric = self.hparams.bleu_computer()
-
         if stage != sb.Stage.TRAIN:
-            self.acc_metric = self.hparams.acc_computer()
-            self.bleu_metric = self.hparams.bleu_computer()
+            self.acc_metric = self.hparams.acc_computer() 
+            self.cer_metric = self.hparams.cer_computer()
+            self.wer_metric = self.hparams.error_rate_computer()
 
     def on_stage_end(self, stage, stage_loss, epoch):
         """Gets called at the end of a epoch."""
@@ -140,15 +141,15 @@ class ASR(sb.core.Brain):
 
         else:  # valid or test
             stage_stats = {"loss": stage_loss}
+            stage_stats["CER"] = self.cer_metric.summarize("error_rate")
+            stage_stats["WER"] = self.wer_metric.summarize("error_rate")
             stage_stats["ACC"] = self.acc_metric.summarize()
-            stage_stats["BLEU"] = self.bleu_metric.summarize(field="BLEU")
-            stage_stats["BLEU_extensive"] = self.bleu_metric.summarize()
 
         # log stats and save checkpoint at end-of-epoch
         if stage == sb.Stage.VALID and sb.utils.distributed.if_main_process():
             current_epoch = self.hparams.epoch_counter.current
             old_lr_adam, new_lr_adam = self.hparams.lr_annealing_adam(
-                stage_stats["BLEU"]
+                stage_stats["WER"]
             )
             sb.nnet.schedulers.update_learning_rate(
                 self.adam_optimizer, new_lr_adam
@@ -158,7 +159,7 @@ class ASR(sb.core.Brain):
                 (
                     old_lr_wav2vec,
                     new_lr_wav2vec,
-                ) = self.hparams.lr_annealing_wav2vec(stage_stats["BLEU"])
+                ) = self.hparams.lr_annealing_wav2vec(stage_stats["WER"])
                 sb.nnet.schedulers.update_learning_rate(
                     self.wav2vec_optimizer, new_lr_wav2vec
                 )
@@ -179,11 +180,11 @@ class ASR(sb.core.Brain):
                 )
 
             # create checkpoint
-            meta = {"BLEU": stage_stats["BLEU"], "epoch": current_epoch}
+            meta = {"WER": stage_stats["WER"], "epoch": current_epoch}
             name = "checkpoint_epoch" + str(current_epoch)
 
             self.checkpointer.save_and_keep_only(
-                meta=meta, name=name, num_to_keep=10, max_keys=["BLEU"]
+                meta=meta, name=name, num_to_keep=10, min_keys=["WER"]
             )
 
         elif stage == sb.Stage.TEST:
@@ -226,10 +227,10 @@ def dataio_prepare(hparams):
     @sb.utils.data_pipeline.provides(
         "transcription", "tokens_list", "tokens_bos", "tokens_eos"
     )
-    def reference_text_pipeline(translation):
+    def reference_text_pipeline(transcription):
         """Processes the transcriptions to generate proper labels"""
-        yield translation
-        tokens_list = tokenizer.sp.encode_as_ids(translation)
+        yield transcription
+        tokens_list = tokenizer.sp.encode_as_ids(transcription)
         yield tokens_list
         tokens_bos = torch.LongTensor([hparams["bos_index"]] + (tokens_list))
         yield tokens_bos
@@ -421,10 +422,19 @@ if __name__ == "__main__":
         train_loader_kwargs=hparams["dataloader_options"],
         valid_loader_kwargs=hparams["test_dataloader_options"],
     )
-
-    # Test
+    
+    # Test    
+    logger.info("Evaluating last checkpoint:")
     for dataset in ["dev", "test"]:
         asr_brain.evaluate(
             datasets[dataset],
+            test_loader_kwargs=hparams["test_dataloader_options"],
+        )
+
+    logger.info("Evaluating best checkpoint (least WER):")
+    for dataset in ["dev", "test"]:
+        test_stats = asr_brain.evaluate(
+            test_set=datasets[dataset],
+            min_key="WER",
             test_loader_kwargs=hparams["test_dataloader_options"],
         )

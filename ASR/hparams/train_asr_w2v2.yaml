@@ -194,8 +194,10 @@ test_search: !new:speechbrain.decoders.S2STransformerBeamSearch
     using_eos_threshold: True
     length_normalization: True
 
-bleu_computer: !name:speechbrain.utils.bleu.BLEUStats
-    merge_words: False
-    lang: !ref <lang>
+# Functions that compute the statistics to track during the validation step.
+error_rate_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+
+cer_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+    split_tokens: True
 
 acc_computer: !name:speechbrain.utils.Accuracy.AccuracyStats
