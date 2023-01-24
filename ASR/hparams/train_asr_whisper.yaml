@@ -24,17 +24,18 @@ lang: "fr" #for the BLEU score detokenization
 vocab_size: 1000 #for SentencePiece tokenizer (unigram)
 
 # URL for the HuggingFace model we want to load
-whisper_hub: "openai/whisper-medium"
+whisper_hub: "openai/whisper-tiny"
 
 # Whisper specific parameters
 whisper_frozen: False
 keep_n_layers: 6 # keep first N layers from the Transformer Encoder stack inside the whisper model
+
 # Training parameters
 number_of_epochs: 100
 lr: 0.001
-lr_whisper: 0.001
-batch_size: 2
-test_batch_size: 4
+lr_whisper: 0.00001
+batch_size: 32
+test_batch_size: 8
 loss_reduction: batchmean
 ckpt_interval_minutes: 15 # save checkpoint every N min
 
@@ -54,12 +55,12 @@ dataloader_options:
 
 test_dataloader_options:
     batch_size: !ref <test_batch_size>
-    num_workers: 8
+    num_workers: 16
 
 # Feature parameters (Whisper)
-features_dim: 1024 #base whisper output dimension, for large replace by 1024
+features_dim: 384 #base whisper output dimension, for large replace by 1024
 
-#projection for w2v
+#projection for whisper
 enc_dnn_layers: 1
 enc_dnn_neurons: 256
 
@@ -191,8 +192,10 @@ test_search: !new:speechbrain.decoders.S2STransformerBeamSearch
     using_eos_threshold: True
     length_normalization: True
 
-bleu_computer: !name:speechbrain.utils.bleu.BLEUStats
-    merge_words: False
-    lang: !ref <lang>
+# Functions that compute the statistics to track during the validation step.
+error_rate_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+
+cer_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+    split_tokens: True
 
 acc_computer: !name:speechbrain.utils.Accuracy.AccuracyStats
