@@ -8,7 +8,7 @@
 # ############################################################################
 
 # Seed needs to be set at top of yaml, before objects with parameters are made
-seed: 6123
+seed: 668
 __set_seed: !!python/object/apply:torch.manual_seed [!ref <seed>]
 debug: False
 output_folder: !ref output/<seed>
@@ -24,7 +24,7 @@ lang: "fr" #for the BLEU score detokenization
 vocab_size: 1000 #for SentencePiece tokenizer (unigram)
 
 # URL for the HuggingFace model we want to load
-whisper_hub: "openai/whisper-tiny"
+whisper_hub: openai/whisper-small
 
 # Whisper specific parameters
 whisper_frozen: False
@@ -32,12 +32,12 @@ keep_n_layers: 6 # keep first N layers from the Transformer Encoder stack inside
 
 # Training parameters
 number_of_epochs: 100
-lr: 0.001
-lr_whisper: 0.00001
-batch_size: 32
+lr: 0.0001
+lr_whisper: 0.000005
+batch_size: 12
 test_batch_size: 8
 loss_reduction: batchmean
-ckpt_interval_minutes: 15 # save checkpoint every N min
+ckpt_interval_minutes: 10 # save checkpoint every N min
 
 # yamllint disable-line rule:line-length
 # Data sorting parameters: sorting_debug_duration replaces sorting_min_duration in debug mode
@@ -58,7 +58,7 @@ test_dataloader_options:
     num_workers: 16
 
 # Feature parameters (Whisper)
-features_dim: 384 #base whisper output dimension, for large replace by 1024
+features_dim: 768 #base whisper output dimension, for large replace by 1024
 
 #projection for whisper
 enc_dnn_layers: 1

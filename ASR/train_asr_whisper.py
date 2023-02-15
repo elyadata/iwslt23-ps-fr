@@ -78,10 +78,14 @@ class ASR(sb.core.Brain):
                 detokenizer.detokenize(transcription.split(" "))
                 for transcription in batch.transcription
             ]
-            
+
             # tracking error rate
-            self.wer_metric.append(batch.id, predictions, detokenized_transcription)
-            self.cer_metric.append(batch.id, predictions, detokenized_transcription)
+            self.wer_metric.append(
+                batch.id, predictions, detokenized_transcription
+            )
+            self.cer_metric.append(
+                batch.id, predictions, detokenized_transcription
+            )
 
             # compute the accuracy of the one-step-forward prediction
             self.acc_metric.append(p_seq, tokens_eos, tokens_eos_lens)
@@ -89,7 +93,7 @@ class ASR(sb.core.Brain):
         return loss
 
     def init_optimizers(self):
-        """ Initializes the whisper optimizer if the model is not whisper_frozen """
+        """Initializes the whisper optimizer if the model is not whisper_frozen"""
         if not self.hparams.whisper_frozen:
             self.whisper_optimizer = self.hparams.whisper_opt_class(
                 self.modules.whisper.parameters()
@@ -131,7 +135,7 @@ class ASR(sb.core.Brain):
         """Gets called when a stage (either training, validation, test) starts."""
 
         if stage != sb.Stage.TRAIN:
-            self.acc_metric = self.hparams.acc_computer() 
+            self.acc_metric = self.hparams.acc_computer()
             self.cer_metric = self.hparams.cer_computer()
             self.wer_metric = self.hparams.error_rate_computer()
 
@@ -200,14 +204,16 @@ def dataio_prepare(hparams):
     """This function prepares the datasets to be used in the brain class.
     It also defines the data processing pipeline through user-defined functions."""
 
-    # Define audio pipeline. In this case, we simply read the filename 
+    # Define audio pipeline. In this case, we simply read the filename
     # and a start and stop timestamps from the dict passed as argument
     @sb.utils.data_pipeline.takes("path", "start", "stop", "id")
     @sb.utils.data_pipeline.provides("sig")
     def audio_pipeline(wav, start, stop, id):
         """Load the audio signal. This is done on the CPU in the `collate_fn`."""
 
-        sig = sb.dataio.dataio.read_audio({"start": start, "stop": stop, "file": wav})
+        sig = sb.dataio.dataio.read_audio(
+            {"start": start, "stop": stop, "file": wav}
+        )
         torch.cuda.empty_cache()
         return sig
 
@@ -215,7 +221,9 @@ def dataio_prepare(hparams):
     @sb.utils.data_pipeline.provides("sig")
     def sp_audio_pipeline(wav, start, stop):
         """Load the audio signal. This is done on the CPU in the `collate_fn`."""
-        sig = sb.dataio.dataio.read_audio({"start": start, "stop": stop, "file": wav})
+        sig = sb.dataio.dataio.read_audio(
+            {"start": start, "stop": stop, "file": wav}
+        )
         sig = sig.unsqueeze(0)
         sig = hparams["speed_perturb"](sig)
         sig = sig.squeeze(0)
@@ -411,23 +419,33 @@ if __name__ == "__main__":
     datasets, tokenizer = dataio_prepare(hparams)
 
     # Before training, we drop some of the Whisper Transformer Encoder layers
-    if len(asr_brain.modules.whisper.model.encoder.layers) > hparams["keep_n_layers"]:
+    logger.info(
+        f"Number of encoder layers: {len(asr_brain.modules.whisper.model.encoder.layers)}"
+    )
+    if (
+        len(asr_brain.modules.whisper.model.encoder.layers)
+        > hparams["keep_n_layers"]
+    ):
         asr_brain.modules.whisper.model.encoder.layers = asr_brain.modules.whisper.model.encoder.layers[
             : hparams["keep_n_layers"]
         ]
-    n_last_layers_kept = hparams["keep_n_layers"]
-    logger.warning(f"Cannot keep the {n_last_layers_kept} last layers of the Whisper encoder since it only has {len(asr_brain.modules.whisper.model.encoder.layers)} layers. Will not drop any layers.")
+
+    else:
+        n_last_layers_kept = hparams["keep_n_layers"]
+        logger.warning(
+            f"Cannot keep the {n_last_layers_kept} last layers of the Whisper encoder since it only has {len(asr_brain.modules.whisper.model.encoder.layers)} layers. Will not drop any layers."
+        )
 
     # Training
     asr_brain.fit(
-            asr_brain.hparams.epoch_counter,
-            datasets["train"],
-            datasets["dev"],
-            train_loader_kwargs=hparams["dataloader_options"],
-            valid_loader_kwargs=hparams["test_dataloader_options"],
-        )
+        asr_brain.hparams.epoch_counter,
+        datasets["train"],
+        datasets["dev"],
+        train_loader_kwargs=hparams["dataloader_options"],
+        valid_loader_kwargs=hparams["test_dataloader_options"],
+    )
 
-    # Test    
+    # Test
     logger.info("Evaluating last checkpoint:")
     for dataset in ["dev", "test"]:
         asr_brain.evaluate(
