@@ -12,7 +12,6 @@ from speechbrain.utils.distributed import run_on_main
 from hyperpyyaml import load_hyperpyyaml
 from sacremoses import MosesDetokenizer
 
-
 # Define training procedure
 class ASR(sb.core.Brain):
     def compute_forward(self, batch, stage):
@@ -59,10 +58,10 @@ class ASR(sb.core.Brain):
 
         # loss
         loss = self.hparams.seq_cost(p_seq, tokens_eos, length=tokens_eos_lens)
-        
+
         if loss.isnan():
             logger.warning(f"NaN loss found: {loss}")
-        
+
         detokenizer = MosesDetokenizer(lang=self.hparams.lang)
 
         if stage != sb.Stage.TRAIN:
@@ -79,8 +78,12 @@ class ASR(sb.core.Brain):
             ]
 
             # tracking error rate
-            self.wer_metric.append(batch.id, predictions, detokenized_transcription)
-            self.cer_metric.append(batch.id, predictions, detokenized_transcription)
+            self.wer_metric.append(
+                batch.id, predictions, detokenized_transcription
+            )
+            self.cer_metric.append(
+                batch.id, predictions, detokenized_transcription
+            )
 
             # compute the accuracy of the one-step-forward prediction
             self.acc_metric.append(p_seq, tokens_eos, tokens_eos_lens)
@@ -129,7 +132,7 @@ class ASR(sb.core.Brain):
     def on_stage_start(self, stage, epoch):
         """Gets called when a stage (either training, validation, test) starts."""
         if stage != sb.Stage.TRAIN:
-            self.acc_metric = self.hparams.acc_computer() 
+            self.acc_metric = self.hparams.acc_computer()
             self.cer_metric = self.hparams.cer_computer()
             self.wer_metric = self.hparams.error_rate_computer()
 
@@ -199,14 +202,16 @@ def dataio_prepare(hparams):
     """This function prepares the datasets to be used in the brain class.
     It also defines the data processing pipeline through user-defined functions."""
 
-    # Define audio pipeline. In this case, we simply read the filename 
+    # Define audio pipeline. In this case, we simply read the filename
     # and a start and stop timestamps from the dict passed as argument
     @sb.utils.data_pipeline.takes("path", "start", "stop", "id")
     @sb.utils.data_pipeline.provides("sig")
     def audio_pipeline(wav, start, stop, id):
         """Load the audio signal. This is done on the CPU in the `collate_fn`."""
-        
-        sig = sb.dataio.dataio.read_audio({"start": start, "stop": stop, "file": wav})
+
+        sig = sb.dataio.dataio.read_audio(
+            {"start": start, "stop": stop, "file": wav}
+        )
         torch.cuda.empty_cache()
         return sig
 
@@ -214,7 +219,9 @@ def dataio_prepare(hparams):
     @sb.utils.data_pipeline.provides("sig")
     def sp_audio_pipeline(wav, start, stop):
         """Load the audio signal. This is done on the CPU in the `collate_fn`."""
-        sig = sb.dataio.dataio.read_audio({"start": start, "stop": stop, "file": wav})
+        sig = sb.dataio.dataio.read_audio(
+            {"start": start, "stop": stop, "file": wav}
+        )
         sig = sig.unsqueeze(0)
         sig = hparams["speed_perturb"](sig)
         sig = sig.squeeze(0)
@@ -317,7 +324,7 @@ def dataio_prepare(hparams):
             )
 
         hparams["dataloader_options"]["shuffle"] = False
-        
+
     elif hparams["sorting"] == "descending":
         # use smaller dataset to debug the model
         if hparams["debug"]:
@@ -342,7 +349,7 @@ def dataio_prepare(hparams):
             )
 
         hparams["dataloader_options"]["shuffle"] = False
-        
+
     elif hparams["sorting"] == "random":
         # use smaller dataset to debug the model
         if hparams["debug"]:
@@ -410,9 +417,11 @@ if __name__ == "__main__":
     datasets, tokenizer = dataio_prepare(hparams)
 
     # Before training, we drop some of the wav2vec 2.0 Transformer Encoder layers
-    asr_brain.modules.wav2vec2.model.encoder.layers = asr_brain.modules.wav2vec2.model.encoder.layers[
-        : hparams["keep_n_layers"]
-    ]
+    asr_brain.modules.wav2vec2.model.encoder.layers = (
+        asr_brain.modules.wav2vec2.model.encoder.layers[
+            : hparams["keep_n_layers"]
+        ]
+    )
 
     # Training
     asr_brain.fit(
@@ -422,8 +431,8 @@ if __name__ == "__main__":
         train_loader_kwargs=hparams["dataloader_options"],
         valid_loader_kwargs=hparams["test_dataloader_options"],
     )
-    
-    # Test    
+
+    # Test
     logger.info("Evaluating last checkpoint:")
     for dataset in ["dev", "test"]:
         asr_brain.evaluate(

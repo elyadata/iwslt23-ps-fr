@@ -1,6 +1,6 @@
 # ############################################################################
-# Model: E2E ST with wav2vec 2.0 encoder
-# Encoder: wav2vec 2.0 + linear projection
+# Model: E2E ASR with Whisper encoder
+# Encoder: Whisper + linear projection
 # Decoder: Transformer
 # Tokens: unigram (1000)
 # losses: NLL
@@ -8,47 +8,46 @@
 # ############################################################################
 
 # Seed needs to be set at top of yaml, before objects with parameters are made
-seed: 1234
+seed: 669
 __set_seed: !!python/object/apply:torch.manual_seed [!ref <seed>]
 debug: False
 output_folder: !ref output/<seed>
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.log
 
-max_segment_duration: 270 # Specifies max segment duration: 179 will ignore 2 files, 269 will ignore 1
+max_segment_duration: 179 # Specifies max segment duration: 179 will ignore 2 files, 269 will ignore 1
 
-# root data folder points to 17h version inside the github folder (IWSLT2022_Tamasheq_data/taq_fra_clean/)
 root_data_folder: !PLACEHOLDER
 # data folder is the place where the json files will be stored prior to training
-data_folder: !ref <root_data_folder>/json_prepared_st
+data_folder: !ref <root_data_folder>/json_prepared
 lang: "fr" #for the BLEU score detokenization
-vocab_size: 1200 #for SentencePiece tokenizer (unigram)
+vocab_size: 1000 #for SentencePiece tokenizer (unigram)
 
-# URL for the HuggingFace model we want to load (BASE here)
-wav2vec2_hub: LIA-AvignonUniversity/IWSLT2022-tamasheq-only #ihanif/wav2vec2-xls-r-300m-pashto-lm
+# URL for the HuggingFace model we want to load
+whisper_hub: "openai/whisper-small"
 
-# wav2vec 2.0 specific parameters
-wav2vec2_frozen: False
-keep_n_layers: 6 # keep first N layers from the Transformer Encoder stack inside the wav2vec 2.0 model
+# Pre-trained model path (if any)
+asr_model_path: ""
+
+# Whisper specific parameters
+whisper_frozen: False
+keep_n_layers: 12 # keep first N layers from the Transformer Encoder stack inside the whisper model
 
 # Training parameters
 number_of_epochs: 100
-lr: 0.001
-lr_wav2vec: 0.00001
-batch_size: 2
+lr: 0.0001
+lr_whisper: 0.000001
+batch_size: 4
 test_batch_size: 4
 loss_reduction: batchmean
 ckpt_interval_minutes: 15 # save checkpoint every N min
 
-# Dynamic batching parameters
-max_batch_length: 432000
-num_buckets: 60
-
+# yamllint disable-line rule:line-length
 # Data sorting parameters: sorting_debug_duration replaces sorting_min_duration in debug mode
-sorting: descending
+sorting: ascending
 sorting_min_duration: 0
 sorting_debug_duration: 3
-sorting_max_duration: 20
+sorting_max_duration: !ref <max_segment_duration>
 
 epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
     limit: !ref <number_of_epochs>
@@ -59,12 +58,12 @@ dataloader_options:
 
 test_dataloader_options:
     batch_size: !ref <test_batch_size>
-    num_workers: 8
+    num_workers: 4
 
-# Feature parameters (W2V2 etc)
-features_dim: 768 #base wav2vec output dimension, for large replace by 1024
+# Feature parameters (Whisper)
+features_dim: 768 #base whisper output dimension, for large replace by 1024
 
-#projection for w2v
+#projection for whisper
 enc_dnn_layers: 1
 enc_dnn_neurons: 256
 
@@ -76,6 +75,7 @@ num_decoder_layers: 3
 d_ffn: 1024
 transformer_dropout: 0.1
 activation: !name:torch.nn.GELU
+# yamllint disable-line rule:line-length
 output_neurons: !ref <vocab_size> # /!\ needs to be changed accordingly to the vocabulary
 attention_type: "regularMHA" # "RelPosMHAXL" or "regularMHA"
 
@@ -94,12 +94,12 @@ valid_beam_size: 5
 test_beam_size: 5
 
 ############################## models ################################
-#wav2vec model
-wav2vec2: !new:speechbrain.lobes.models.huggingface_wav2vec.HuggingFaceWav2Vec2
-    source: !ref <wav2vec2_hub>
-    output_norm: True
-    freeze: !ref <wav2vec2_frozen>
-    save_path: !ref <save_folder>/wav2vec2_checkpoint
+# Whisper encoder
+whisper: !new:speechbrain.lobes.models.huggingface_whisper.HuggingFaceWhisper
+    source: !ref <whisper_hub>
+    freeze: !ref <whisper_frozen>
+    encoder_only: True
+    save_path: !ref <save_folder>/whisper_checkpoint
 
 
 #linear projection
@@ -132,7 +132,7 @@ seq_lin: !new:speechbrain.nnet.linear.Linear
     n_neurons: !ref <output_neurons>
 
 modules:
-    wav2vec2: !ref <wav2vec2>
+    whisper: !ref <whisper>
     enc: !ref <enc>
     Transformer: !ref <Transformer>
     seq_lin: !ref <seq_lin>
@@ -143,8 +143,8 @@ model: !new:torch.nn.ModuleList
 adam_opt_class: !name:torch.optim.Adam
     lr: !ref <lr>
 
-wav2vec_opt_class: !name:torch.optim.Adam
-    lr: !ref <lr_wav2vec>
+whisper_opt_class: !name:torch.optim.Adam
+    lr: !ref <lr_whisper>
 
 seq_cost: !name:speechbrain.nnet.losses.nll_loss
     label_smoothing: !ref <label_smoothing>
@@ -156,8 +156,8 @@ lr_annealing_adam: !new:speechbrain.nnet.schedulers.NewBobScheduler
     annealing_factor: 0.5
     patient: 2
 
-lr_annealing_wav2vec: !new:speechbrain.nnet.schedulers.NewBobScheduler
-    initial_value: !ref <lr_wav2vec>
+lr_annealing_whisper: !new:speechbrain.nnet.schedulers.NewBobScheduler
+    initial_value: !ref <lr_whisper>
     improvement_threshold: 0.0025
     annealing_factor: 0.9
 
@@ -165,10 +165,15 @@ checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     checkpoints_dir: !ref <save_folder>
     recoverables:
         model: !ref <model>
-        wav2vec2: !ref <wav2vec2>
+        whisper: !ref <whisper>
         lr_annealing_adam: !ref <lr_annealing_adam>
-        lr_annealing_wav2vec: !ref <lr_annealing_wav2vec>
+        lr_annealing_whisper: !ref <lr_annealing_whisper>
         counter: !ref <epoch_counter>
+
+# Transferring ASR models to ST
+asr_transfer_checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <asr_model_path>
+asr_min_key: "WER"
 
 train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
     save_file: !ref <train_log>
@@ -195,6 +200,7 @@ test_search: !new:speechbrain.decoders.S2STransformerBeamSearch
     using_eos_threshold: True
     length_normalization: True
 
+# Functions that compute the statistics to track during the validation step.
 bleu_computer: !name:speechbrain.utils.bleu.BLEUStats
     merge_words: False
     lang: !ref <lang>

@@ -16,16 +16,18 @@ from speechbrain.utils.distributed import run_on_main
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from prepare_ps_fr import data_proc
+from prepare_scraped_data import prepare_dw_pashto
+
 
 # Define training procedure
-class ASR(sb.core.Brain):
+class ST(sb.core.Brain):
     def compute_forward(self, batch, stage):
         """Forward computations from the waveform batches to the output probabilities."""
 
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig  # audio
-
-        tokens_bos, _ = batch.tokens_bos  # transcriptions
+        tokens_bos, _ = batch.tokens_bos  # translations
 
         # Whisper module
         feats = self.modules.whisper(wavs)
@@ -60,6 +62,7 @@ class ASR(sb.core.Brain):
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss given predictions and targets."""
         (p_seq, _, hyps) = predictions
+        ids = batch.id
         tokens_eos, tokens_eos_lens = batch.tokens_eos
 
         # st loss
@@ -68,28 +71,24 @@ class ASR(sb.core.Brain):
         if loss.isnan():
             logger.warning(f"NaN loss found: {loss}")
 
-        detokenizer = MosesDetokenizer(lang=self.hparams.lang)
+        fr_detokenizer = MosesDetokenizer(lang=self.hparams.lang)
 
         if stage != sb.Stage.TRAIN:
             predictions = [
-                detokenizer.detokenize(
+                fr_detokenizer.detokenize(
                     tokenizer.sp.decode_ids(utt_seq).split(" ")
                 )
                 for utt_seq in hyps
             ]
 
-            detokenized_transcription = [
-                detokenizer.detokenize(transcription.split(" "))
-                for transcription in batch.transcription
+            detokenized_translations = [
+                fr_detokenizer.detokenize(translation.split(" "))
+                for translation in batch.translation
             ]
+            # it needs to be a list of list due to the extend on the bleu implementation
+            targets = [detokenized_translations]
 
-            # tracking error rate
-            self.wer_metric.append(
-                batch.id, predictions, detokenized_transcription
-            )
-            self.cer_metric.append(
-                batch.id, predictions, detokenized_transcription
-            )
+            self.bleu_metric.append(ids, predictions, targets)
 
             # compute the accuracy of the one-step-forward prediction
             self.acc_metric.append(p_seq, tokens_eos, tokens_eos_lens)
@@ -97,7 +96,7 @@ class ASR(sb.core.Brain):
         return loss
 
     def init_optimizers(self):
-        """Initializes the whisper optimizer if the model is not whisper_frozen"""
+        """ Initializes the whisper optimizer if the model is not whisper_frozen """
         if not self.hparams.whisper_frozen:
             self.whisper_optimizer = self.hparams.whisper_opt_class(
                 self.modules.whisper.parameters()
@@ -137,11 +136,9 @@ class ASR(sb.core.Brain):
 
     def on_stage_start(self, stage, epoch):
         """Gets called when a stage (either training, validation, test) starts."""
-
         if stage != sb.Stage.TRAIN:
             self.acc_metric = self.hparams.acc_computer()
-            self.cer_metric = self.hparams.cer_computer()
-            self.wer_metric = self.hparams.error_rate_computer()
+            self.bleu_metric = self.hparams.bleu_computer()
 
     def on_stage_end(self, stage, stage_loss, epoch):
         """Gets called at the end of a epoch."""
@@ -150,15 +147,15 @@ class ASR(sb.core.Brain):
 
         else:  # valid or test
             stage_stats = {"loss": stage_loss}
-            stage_stats["CER"] = self.cer_metric.summarize("error_rate")
-            stage_stats["WER"] = self.wer_metric.summarize("error_rate")
             stage_stats["ACC"] = self.acc_metric.summarize()
+            stage_stats["BLEU"] = self.bleu_metric.summarize(field="BLEU")
+            stage_stats["BLEU_extensive"] = self.bleu_metric.summarize()
 
         # log stats and save checkpoint at end-of-epoch
         if stage == sb.Stage.VALID and sb.utils.distributed.if_main_process():
             current_epoch = self.hparams.epoch_counter.current
             old_lr_adam, new_lr_adam = self.hparams.lr_annealing_adam(
-                stage_stats["WER"]
+                stage_stats["BLEU"]
             )
             sb.nnet.schedulers.update_learning_rate(
                 self.adam_optimizer, new_lr_adam
@@ -168,7 +165,7 @@ class ASR(sb.core.Brain):
                 (
                     old_lr_whisper,
                     new_lr_whisper,
-                ) = self.hparams.lr_annealing_whisper(stage_stats["WER"])
+                ) = self.hparams.lr_annealing_whisper(stage_stats["BLEU"])
                 sb.nnet.schedulers.update_learning_rate(
                     self.whisper_optimizer, new_lr_whisper
                 )
@@ -189,11 +186,11 @@ class ASR(sb.core.Brain):
                 )
 
             # create checkpoint
-            meta = {"WER": stage_stats["WER"], "epoch": current_epoch}
+            meta = {"BLEU": stage_stats["BLEU"], "epoch": current_epoch}
             name = "checkpoint_epoch" + str(current_epoch)
 
             self.checkpointer.save_and_keep_only(
-                meta=meta, name=name, num_to_keep=10, min_keys=["WER"]
+                meta=meta, name=name, num_to_keep=10, max_keys=["BLEU"]
             )
 
         elif stage == sb.Stage.TEST:
@@ -202,12 +199,12 @@ class ASR(sb.core.Brain):
                 test_stats=stage_stats,
             )
 
-    def transcribe_dataset(
-        self,
-        dataset: sb.dataio.dataset,
-        tokenizer,
-        min_key: str,
-        loader_kwargs: dict,
+    def translate_dataset(
+            self,
+            dataset: sb.dataio.dataset,
+            tokenizer,
+            max_key: str,
+            loader_kwargs: dict,
     ) -> List[dict]:
         # If dataset isn't a Dataloader, we create it.
         if not isinstance(dataset, DataLoader):
@@ -215,15 +212,12 @@ class ASR(sb.core.Brain):
             dataset = self.make_dataloader(
                 dataset, sb.Stage.TEST, **loader_kwargs
             )
-
-        self.on_evaluate_start(
-            min_key=min_key
-        )  # We call the on_evaluate_start that will load the best model
+        # We call the on_evaluate_start that will load the best model
+        self.on_evaluate_start(max_key=max_key)
         self.modules.eval()  # We set the model to eval mode (remove dropout etc)
-        detokenizer = MosesDetokenizer(lang="ps")
 
         # Now we iterate over the dataset: we simply compute_forward and decode
-        transcripts = []
+        transcripts = list()
         with torch.no_grad():
             for batch in tqdm(dataset, dynamic_ncols=True):
 
@@ -238,19 +232,17 @@ class ASR(sb.core.Brain):
                 ]
 
                 for (
-                    segment_id,
-                    transcription,
-                    start,
-                    stop,
-                    path,
-                    duration,
+                        segment_id,
+                        transcription,
+                        start,
+                        stop,
+                        path,
                 ) in zip(
                     batch.id,
                     batch_transcripts,
                     batch.start,
                     batch.stop,
                     batch.path,
-                    batch.duration,
                 ):
                     segment = dict()
                     segment["segment_id"] = str(segment_id)
@@ -258,7 +250,6 @@ class ASR(sb.core.Brain):
                     segment["transcription"] = transcription.strip()
                     segment["start"] = int(start)
                     segment["stop"] = int(stop)
-                    segment["duration"] = int(duration)
 
                     transcripts.append(segment)
 
@@ -298,14 +289,14 @@ def dataio_prepare(hparams):
     # Define text processing pipeline. We start from the raw text and then
     # encode it using the tokenizer. The tokens with BOS are used for feeding
     # decoder during training, the tokens with EOS for computing the cost function.
-    @sb.utils.data_pipeline.takes("transcription")
+    @sb.utils.data_pipeline.takes("translation")
     @sb.utils.data_pipeline.provides(
-        "transcription", "tokens_list", "tokens_bos", "tokens_eos"
+        "translation", "tokens_list", "tokens_bos", "tokens_eos"
     )
-    def reference_text_pipeline(transcription):
-        """Processes the transcriptions to generate proper labels"""
-        yield transcription
-        tokens_list = tokenizer.sp.encode_as_ids(transcription)
+    def reference_text_pipeline(translation):
+        """Processes the translations to generate proper labels"""
+        yield translation
+        tokens_list = tokenizer.sp.encode_as_ids(translation)
         yield tokens_list
         tokens_bos = torch.LongTensor([hparams["bos_index"]] + (tokens_list))
         yield tokens_bos
@@ -314,12 +305,16 @@ def dataio_prepare(hparams):
 
     data_folder = hparams["data_folder"]
 
+    if hparams["use_scraped_data"]:
+        annotation_train = hparams["prepared_train_json_for_scraped_data"]
+    else:
+        annotation_train = data_folder + "/train.json"
     # 1. train tokenizer on the data
     tokenizer = SentencePiece(
         model_dir=hparams["save_folder"],
         vocab_size=hparams["vocab_size"],
-        annotation_train=data_folder + "/train.json",
-        annotation_read="transcription",
+        annotation_train=annotation_train,
+        annotation_read="translation",
         annotation_format="json",
         model_type="unigram",
         bos_id=hparams["bos_index"],
@@ -329,7 +324,10 @@ def dataio_prepare(hparams):
     # 2. load data and tokenize with trained tokenizer
     datasets = {}
     for dataset in ["train", "dev"]:
-        json_path = f"{data_folder}/{dataset}.json"
+        if dataset == "train" and hparams["use_scraped_data"]:
+            json_path = annotation_train
+        else:
+            json_path = f"{data_folder}/{dataset}.json"
 
         is_use_sp = dataset == "train" and "speed_perturb" in hparams
         audio_pipeline_func = sp_audio_pipeline if is_use_sp else audio_pipeline
@@ -342,7 +340,7 @@ def dataio_prepare(hparams):
                 "id",
                 "sig",
                 "duration",
-                "transcription",
+                "translation",
                 "tokens_list",
                 "tokens_bos",
                 "tokens_eos",
@@ -359,7 +357,7 @@ def dataio_prepare(hparams):
                 "id",
                 "sig",
                 "duration",
-                "transcription",
+                "translation",
                 "tokens_list",
                 "tokens_bos",
                 "tokens_eos",
@@ -463,7 +461,7 @@ if __name__ == "__main__":
     )
 
     # Create main experiment class
-    asr_brain = ASR(
+    st_brain = ST(
         modules=hparams["modules"],
         hparams=hparams,
         run_opts=run_opts,
@@ -471,58 +469,91 @@ if __name__ == "__main__":
     )
 
     # Data preparation
-    import prepare_ps_asr
-
     run_on_main(
-        prepare_ps_asr.data_proc,
+        data_proc,
         kwargs={
             "dataset_folder": hparams["root_data_folder"],
             "output_folder": hparams["data_folder"],
             "max_duration": hparams["max_segment_duration"],
         },
     )
+
+    # Due to DDP, we do the preparation ONLY on the main python process
+    if hparams["use_scraped_data"]:
+        logger.info("Preparing DW Pashto Dataset...")
+        run_on_main(
+            prepare_dw_pashto,
+            kwargs={
+                "input_json_file_path": hparams["unprepared_train_json_file"],
+                "output_json_file_path": hparams[
+                    "prepared_train_json_for_scraped_data"
+                ],
+                "scraped_dataset_folder": hparams["unlabelled_data_folder"],
+                "official_dataset_folder": hparams["official_data_folder"],
+                "max_duration": hparams["max_segment_duration"],
+                "min_duration": hparams["min_segment_duration"],
+            },
+        )
     # Load datasets for training, valid, and test, trains and applies tokenizer
     datasets, tokenizer = dataio_prepare(hparams)
 
     # Before training, we drop some of the Whisper Transformer Encoder layers
     logger.info(
-        f"Number of encoder layers: {len(asr_brain.modules.whisper.model.encoder.layers)}"
+        f"Initial number of encoder layers: {len(st_brain.modules.whisper.model.encoder.layers)}"
     )
     if (
-        len(asr_brain.modules.whisper.model.encoder.layers)
-        > hparams["keep_n_layers"]
+            len(st_brain.modules.whisper.model.encoder.layers)
+            > hparams["keep_n_layers"]
     ):
-        asr_brain.modules.whisper.model.encoder.layers = asr_brain.modules.whisper.model.encoder.layers[
-            : hparams["keep_n_layers"]
-        ]
+        st_brain.modules.whisper.model.encoder.layers = st_brain.modules.whisper.model.encoder.layers[
+                                                        : hparams["keep_n_layers"]
+                                                        ]
+
+        logger.info(
+            f"Updated number of encoder layers: {len(st_brain.modules.whisper.model.encoder.layers)}"
+        )
 
     else:
         n_last_layers_kept = hparams["keep_n_layers"]
         logger.warning(
-            f"Cannot keep the {n_last_layers_kept} last layers of the Whisper encoder since it only has {len(asr_brain.modules.whisper.model.encoder.layers)} layers. Will not drop any layers."
+            f"Cannot keep the {n_last_layers_kept} last layers of the Whisper encoder since it only has {len(st_brain.modules.whisper.model.encoder.layers)} layers. Will not drop any layers."
         )
+
+    # Load a pre-trained ASR checkpoint
+    # asr_model_path = hparams.get("asr_model_path", None)
+    asr_model_path = hparams["asr_model_path"]
+    if asr_model_path not in [None, ""]:
+        logger.info(f"ASR transfer learning enabled.")
+        logging.disable(
+            logging.WARNING
+        )  # Disabling warnings related to unmatched keys.
+
+        best_asr_checkpoint = hparams[
+            "asr_transfer_checkpointer"
+        ].find_checkpoint(min_key=hparams["asr_min_key"])
+        best_paramfile = best_asr_checkpoint.paramfiles["model"]
+        logger.info(f"Found an ASR checkpoint. Transferring parameters...")
+        sb.utils.checkpoints.torch_parameter_transfer(
+            st_brain.modules, best_paramfile, device="cpu"
+        )
+
+        logging.disable(logging.NOTSET)
 
     # Training
-    asr_brain.fit(
-        asr_brain.hparams.epoch_counter,
-        datasets["train"],
-        datasets["dev"],
-        train_loader_kwargs=hparams["dataloader_options"],
-        valid_loader_kwargs=hparams["test_dataloader_options"],
-    )
+    if not hparams['skip_to_test']:
+        st_brain.fit(
+            st_brain.hparams.epoch_counter,
+            datasets["train"],
+            datasets["dev"],
+            train_loader_kwargs=hparams["dataloader_options"],
+            valid_loader_kwargs=hparams["test_dataloader_options"],
+        )
+    else:
+        logger.info("Skipping to model testing...")
 
     # Test
-    logger.info("Evaluating last checkpoint:")
     for dataset in ["dev", "test"]:
-        asr_brain.evaluate(
+        st_brain.evaluate(
             datasets[dataset],
-            test_loader_kwargs=hparams["test_dataloader_options"],
-        )
-
-    logger.info("Evaluating best checkpoint (least WER):")
-    for dataset in ["dev", "test"]:
-        test_stats = asr_brain.evaluate(
-            test_set=datasets[dataset],
-            min_key="WER",
             test_loader_kwargs=hparams["test_dataloader_options"],
         )

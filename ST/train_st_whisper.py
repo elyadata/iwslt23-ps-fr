@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Recipe for fine-tuning a wav2vec model for the ST task (no transcriptions).
-
-Author
- * Placeholder
+"""
+    Recipe for fine-tuning a Whisper-Lin-transformer model for Pashto ASR.
 """
 
-import sys
-import torch
 import logging
+import sys
+
 import speechbrain as sb
-from speechbrain.tokenizers.SentencePiece import SentencePiece
-from speechbrain.utils.distributed import run_on_main
+import torch
 from hyperpyyaml import load_hyperpyyaml
 from sacremoses import MosesDetokenizer
+from speechbrain.tokenizers.SentencePiece import SentencePiece
+from speechbrain.utils.distributed import run_on_main
 
 
 # Define training procedure
@@ -22,10 +21,10 @@ class ST(sb.core.Brain):
 
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig  # audio
-        tokens_bos, _ = batch.tokens_bos  # translation
+        tokens_bos, _ = batch.tokens_bos  # translations
 
-        # wav2vec module
-        feats = self.modules.wav2vec2(wavs)
+        # Whisper module
+        feats = self.modules.whisper(wavs)
 
         # dimensionality reduction
         src = self.modules.enc(feats)
@@ -56,12 +55,15 @@ class ST(sb.core.Brain):
 
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss given predictions and targets."""
-        (p_seq, wav_lens, hyps) = predictions
+        (p_seq, _, hyps) = predictions
         ids = batch.id
         tokens_eos, tokens_eos_lens = batch.tokens_eos
 
         # st loss
         loss = self.hparams.seq_cost(p_seq, tokens_eos, length=tokens_eos_lens)
+
+        if loss.isnan():
+            logger.warning(f"NaN loss found: {loss}")
 
         fr_detokenizer = MosesDetokenizer(lang=self.hparams.lang)
 
@@ -73,12 +75,12 @@ class ST(sb.core.Brain):
                 for utt_seq in hyps
             ]
 
-            detokenized_translation = [
+            detokenized_translations = [
                 fr_detokenizer.detokenize(translation.split(" "))
-                for translation in batch.trans
+                for translation in batch.translation
             ]
             # it needs to be a list of list due to the extend on the bleu implementation
-            targets = [detokenized_translation]
+            targets = [detokenized_translations]
 
             self.bleu_metric.append(ids, predictions, targets)
 
@@ -88,18 +90,18 @@ class ST(sb.core.Brain):
         return loss
 
     def init_optimizers(self):
-        # Initializes the wav2vec2 optimizer if the model is not wav2vec2_frozen
-        if not self.hparams.wav2vec2_frozen:
-            self.wav2vec_optimizer = self.hparams.wav2vec_opt_class(
-                self.modules.wav2vec2.parameters()
+        """ Initializes the whisper optimizer if the model is not whisper_frozen """
+        if not self.hparams.whisper_frozen:
+            self.whisper_optimizer = self.hparams.whisper_opt_class(
+                self.modules.whisper.parameters()
             )
         self.adam_optimizer = self.hparams.adam_opt_class(
             self.hparams.model.parameters()
         )
 
     def zero_grad(self, set_to_none=False):
-        if not self.hparams.wav2vec2_frozen:
-            self.wav2vec_optimizer.zero_grad(set_to_none)
+        if not self.hparams.whisper_frozen:
+            self.whisper_optimizer.zero_grad(set_to_none)
         self.adam_optimizer.zero_grad(set_to_none)
 
     def fit_batch(self, batch):
@@ -109,12 +111,12 @@ class ST(sb.core.Brain):
         loss.backward()
 
         if self.check_gradients(loss):
-            if not self.hparams.wav2vec2_frozen:  # if wav2vec2 is not frozen
-                self.wav2vec_optimizer.step()
+            if not self.hparams.whisper_frozen:  # if Whisper is not frozen
+                self.whisper_optimizer.step()
             self.adam_optimizer.step()
 
-        if not self.hparams.wav2vec2_frozen:
-            self.wav2vec_optimizer.zero_grad()
+        if not self.hparams.whisper_frozen:
+            self.whisper_optimizer.zero_grad()
         self.adam_optimizer.zero_grad()
 
         return loss.detach().cpu()
@@ -128,15 +130,12 @@ class ST(sb.core.Brain):
 
     def on_stage_start(self, stage, epoch):
         """Gets called when a stage (either training, validation, test) starts."""
-        self.bleu_metric = self.hparams.bleu_computer()
-
         if stage != sb.Stage.TRAIN:
             self.acc_metric = self.hparams.acc_computer()
             self.bleu_metric = self.hparams.bleu_computer()
 
     def on_stage_end(self, stage, stage_loss, epoch):
         """Gets called at the end of a epoch."""
-        # Compute/store important stats
         if stage == sb.Stage.TRAIN:
             self.train_stats = stage_loss
 
@@ -145,7 +144,6 @@ class ST(sb.core.Brain):
             stage_stats["ACC"] = self.acc_metric.summarize()
             stage_stats["BLEU"] = self.bleu_metric.summarize(field="BLEU")
             stage_stats["BLEU_extensive"] = self.bleu_metric.summarize()
-            current_epoch = self.hparams.epoch_counter.current
 
         # log stats and save checkpoint at end-of-epoch
         if stage == sb.Stage.VALID and sb.utils.distributed.if_main_process():
@@ -157,19 +155,19 @@ class ST(sb.core.Brain):
                 self.adam_optimizer, new_lr_adam
             )
 
-            if not self.hparams.wav2vec2_frozen:
+            if not self.hparams.whisper_frozen:
                 (
-                    old_lr_wav2vec,
-                    new_lr_wav2vec,
-                ) = self.hparams.lr_annealing_wav2vec(stage_stats["BLEU"])
+                    old_lr_whisper,
+                    new_lr_whisper,
+                ) = self.hparams.lr_annealing_whisper(stage_stats["BLEU"])
                 sb.nnet.schedulers.update_learning_rate(
-                    self.wav2vec_optimizer, new_lr_wav2vec
+                    self.whisper_optimizer, new_lr_whisper
                 )
                 self.hparams.train_logger.log_stats(
                     stats_meta={
                         "epoch": current_epoch,
                         "lr_adam": old_lr_adam,
-                        "lr_wav2vec": old_lr_wav2vec,
+                        "lr_whisper": old_lr_whisper,
                     },
                     train_stats={"loss": self.train_stats},
                     valid_stats=stage_stats,
@@ -201,14 +199,16 @@ def dataio_prepare(hparams):
     """This function prepares the datasets to be used in the brain class.
     It also defines the data processing pipeline through user-defined functions."""
 
-    # Define audio pipeline. In this case, we simply read the filename 
+    # Define audio pipeline. In this case, we simply read the filename
     # and a start and stop timestamps from the dict passed as argument
     @sb.utils.data_pipeline.takes("path", "start", "stop", "id")
     @sb.utils.data_pipeline.provides("sig")
     def audio_pipeline(wav, start, stop, id):
         """Load the audio signal. This is done on the CPU in the `collate_fn`."""
-        
-        sig = sb.dataio.dataio.read_audio({"start": start, "stop": stop, "file": wav})
+
+        sig = sb.dataio.dataio.read_audio(
+            {"start": start, "stop": stop, "file": wav}
+        )
         torch.cuda.empty_cache()
         return sig
 
@@ -216,7 +216,9 @@ def dataio_prepare(hparams):
     @sb.utils.data_pipeline.provides("sig")
     def sp_audio_pipeline(wav, start, stop):
         """Load the audio signal. This is done on the CPU in the `collate_fn`."""
-        sig = sb.dataio.dataio.read_audio({"start": start, "stop": stop, "file": wav})
+        sig = sb.dataio.dataio.read_audio(
+            {"start": start, "stop": stop, "file": wav}
+        )
         sig = sig.unsqueeze(0)
         sig = hparams["speed_perturb"](sig)
         sig = sig.squeeze(0)
@@ -225,12 +227,12 @@ def dataio_prepare(hparams):
     # Define text processing pipeline. We start from the raw text and then
     # encode it using the tokenizer. The tokens with BOS are used for feeding
     # decoder during training, the tokens with EOS for computing the cost function.
-    @sb.utils.data_pipeline.takes("trans")
+    @sb.utils.data_pipeline.takes("translation")
     @sb.utils.data_pipeline.provides(
-        "trans", "tokens_list", "tokens_bos", "tokens_eos"
+        "translation", "tokens_list", "tokens_bos", "tokens_eos"
     )
     def reference_text_pipeline(translation):
-        """Processes the transcriptions to generate proper labels"""
+        """Processes the translations to generate proper labels"""
         yield translation
         tokens_list = tokenizer.sp.encode_as_ids(translation)
         yield tokens_list
@@ -246,7 +248,7 @@ def dataio_prepare(hparams):
         model_dir=hparams["save_folder"],
         vocab_size=hparams["vocab_size"],
         annotation_train=data_folder + "/train.json",
-        annotation_read="trans",
+        annotation_read="translation",
         annotation_format="json",
         model_type="unigram",
         bos_id=hparams["bos_index"],
@@ -269,7 +271,7 @@ def dataio_prepare(hparams):
                 "id",
                 "sig",
                 "duration",
-                "trans",
+                "translation",
                 "tokens_list",
                 "tokens_bos",
                 "tokens_eos",
@@ -286,7 +288,7 @@ def dataio_prepare(hparams):
                 "id",
                 "sig",
                 "duration",
-                "trans",
+                "translation",
                 "tokens_list",
                 "tokens_bos",
                 "tokens_eos",
@@ -319,7 +321,7 @@ def dataio_prepare(hparams):
             )
 
         hparams["dataloader_options"]["shuffle"] = False
-        
+
     elif hparams["sorting"] == "descending":
         # use smaller dataset to debug the model
         if hparams["debug"]:
@@ -344,7 +346,7 @@ def dataio_prepare(hparams):
             )
 
         hparams["dataloader_options"]["shuffle"] = False
-        
+
     elif hparams["sorting"] == "random":
         # use smaller dataset to debug the model
         if hparams["debug"]:
@@ -389,6 +391,14 @@ if __name__ == "__main__":
         overrides=overrides,
     )
 
+    # Create main experiment class
+    st_brain = ST(
+        modules=hparams["modules"],
+        hparams=hparams,
+        run_opts=run_opts,
+        checkpointer=hparams["checkpointer"],
+    )
+
     # Data preparation
     import prepare_ps_fr
 
@@ -402,37 +412,57 @@ if __name__ == "__main__":
     )
     # Load datasets for training, valid, and test, trains and applies tokenizer
     datasets, tokenizer = dataio_prepare(hparams)
-    
-    # Add dynamic batching for more memory efficient training
-    from torch.utils.data import DataLoader
-    from speechbrain.dataio.sampler import DynamicBatchSampler
-    
-    dynamic_batcher = DynamicBatchSampler(
-        datasets["train"],
-        max_batch_length=hparams["max_batch_length"],
-        num_buckets=hparams["num_buckets"],
-        length_func=lambda x: x["duration"],
-        shuffle=False,
-        batch_ordering=hparams["sorting"]
-    )
-    
-    dataloader = DataLoader(datasets["train"], batch_sampler=dynamic_batcher)
-    
-    
-    # Create main experiment class
-    run_opts["batch_sampler"] = dynamic_batcher
-    st_brain = ST(
-        modules=hparams["modules"],
-        hparams=hparams,
-        run_opts=run_opts,
-        checkpointer=hparams["checkpointer"]
-    )
 
-    # Before training, we drop some of the wav2vec 2.0 Transformer Encoder layers
-    st_brain.modules.wav2vec2.model.encoder.layers = st_brain.modules.wav2vec2.model.encoder.layers[
-        : hparams["keep_n_layers"]
-    ]
-    
+    # Load a pre-trained ASR checkpoint  ____ DEPRECATED
+    # if hparams.get("pretrained_asr_checkpoint", None) != None:
+    #     sb.utils.checkpoints.torch_parameter_transfer(
+    #         st_brain.modules.whisper,
+    #         hparams["pretrained_asr_checkpoint"],
+    #         device="cpu",
+    #     )
+
+    # Before training, we drop some of the Whisper Transformer Encoder layers
+    logger.info(
+        f"Initial number of encoder layers: {len(st_brain.modules.whisper.model.encoder.layers)}"
+    )
+    if (
+            len(st_brain.modules.whisper.model.encoder.layers)
+            > hparams["keep_n_layers"]
+    ):
+        st_brain.modules.whisper.model.encoder.layers = st_brain.modules.whisper.model.encoder.layers[
+                                                        : hparams["keep_n_layers"]
+                                                        ]
+
+        logger.info(
+            f"Updated number of encoder layers: {len(st_brain.modules.whisper.model.encoder.layers)}"
+        )
+
+    else:
+        n_last_layers_kept = hparams["keep_n_layers"]
+        logger.warning(
+            f"Cannot keep the {n_last_layers_kept} last layers of the Whisper encoder since it only has {len(st_brain.modules.whisper.model.encoder.layers)} layers. Will not drop any layers."
+        )
+
+    # Load a pre-trained ASR checkpoint
+    # asr_model_path = hparams.get("asr_model_path", None)
+    asr_model_path = hparams["asr_model_path"]
+    if asr_model_path not in [None, ""]:
+        logger.info(f"ASR transfer learning enabled.")
+        logging.disable(
+            logging.WARNING
+        )  # Disabling warnings related to unmatched keys.
+
+        best_asr_checkpoint = hparams[
+            "asr_transfer_checkpointer"
+        ].find_checkpoint(min_key=hparams["asr_min_key"])
+        best_paramfile = best_asr_checkpoint.paramfiles["model"]
+        logger.info(f"Found an ASR checkpoint. Transferring parameters...")
+        sb.utils.checkpoints.torch_parameter_transfer(
+            st_brain.modules, best_paramfile, device="cpu"
+        )
+
+        logging.disable(logging.NOTSET)
+
     # Training
     st_brain.fit(
         st_brain.hparams.epoch_counter,

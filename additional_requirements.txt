@@ -1,0 +1,7 @@
+sacremoses==0.0.53
+sacrebleu==2.3.1
+transformers==4.25.1
+torchvision==0.14.1
+loguru==0.6.0
+datasets
+

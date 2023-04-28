@@ -8,7 +8,12 @@ Haroun Elleuch 2023
 """
 
 import json
+import logging
 import os
+import sys
+
+import speechbrain as sb
+from hyperpyyaml import load_hyperpyyaml
 from tqdm import tqdm
 
 
@@ -21,75 +26,49 @@ def write_json(json_file_name, data):
             indent=2,
             separators=(",", ": "),
         )
-    print("Saved: ",json_file_name)
+    print("Saved: ", json_file_name)
 
 
-def generate_json(dataset_folder, split, max_duration):
-    print(f"Generating JSON manifest for {split} split...")
+def generate_json(dataset_folder, manifest_file_name, max_duration, min_duration):
     output_json = dict()
     ignored_segments_short = list()
     ignored_segments_long = list()
-    SAMPLING_RATE = 16000
+    SAMPLING_RATE: int = 16000
     # Loading speech segments descriptions of the split
-    with open(os.path.join(dataset_folder,"txt",f"{split}.json")) as file:
+    with open(os.path.join(dataset_folder, manifest_file_name)) as file:
         description = json.load(file)
-        
-    # Sorting the descriptions by filename field
-    description = sorted(description, key=lambda d: d['filename'])
-        
-    files = get_files(description)
-    
-    # creating a dict to keep track of the last used index for each file segment
-    segment_counters = dict()
-    for file in files:
-        segment_counters[file] = 0
-        
+
     # generating a unique segment ID
     utt_ids = set()
     for utt in tqdm(description):
-        filename = utt["filename"].split(".wav")[0]
-        segment_counters[filename] += 1
-        utt_id = f"{filename}_id_{segment_counters[filename]}"
-                
-        assert utt_id not in utt_ids
-        utt_ids.add(utt_id)
-        
+        segment = description[utt]
+
+        assert utt not in utt_ids  # Ensuring that the segment has not been preprocessed previously
+        utt_ids.add(utt)
+
         # Creating a new segment entry to be saved in the output_json
         entry = dict()
-        entry["path"] = os.path.join(dataset_folder, "wav", utt["filename"])
-        entry["transcription"] = utt["src"]
-        entry["start"] = int(utt["start"]*SAMPLING_RATE)
-        entry["stop"] = int(utt["end"]*SAMPLING_RATE)
-        entry["duration"] = entry["stop"] - entry["start"]
-        
+        entry["path"] = os.path.join(dataset_folder, "wav", segment["filename"])
+        entry["start"] = int(segment["start"] * SAMPLING_RATE)
+        entry["stop"] = int(segment["end"] * SAMPLING_RATE)
+        entry["duration"] = int(segment["duration"] * SAMPLING_RATE)
+
         # Adding segment to the output JSON
         # ignoring small and large samples due to cuda memory errors
-        if entry["duration"] <= 1 * SAMPLING_RATE:
-            ignored_segments_short.append(utt)
-        elif entry["duration"] >= max_duration * SAMPLING_RATE:
-            ignored_segments_long.append(utt)
+        if segment["duration"] <= min_duration:
+            ignored_segments_short.append(segment)
+        elif segment["duration"] >= max_duration:
+            ignored_segments_long.append(segment)
         else:
-            output_json[utt_id] = entry
-    # Integrity check: same number of segments
-    # assert len(output_json) == len(description)
-    print(f"Ignored {len(ignored_segments_short)} segments for being too short and {len(ignored_segments_long)} for being too long.")
-    
+            output_json[utt] = entry
+
+    print(f"Ignored {len(ignored_segments_short)} segments for being too short \
+        and {len(ignored_segments_long)} for being too long.")
+
     return output_json, ignored_segments_short, ignored_segments_long
 
-def get_files(description: list) -> set:
-    """ Gets a set of filenames used in the dataset split
-    Args:
-        description (dict): A dictionnary containing the loaded JSON description file contents
 
-    Returns:
-        set: All files referenced in the JSON contents
-    """
-    files = set()
-    for segment in description:
-        files.add(segment["filename"].split(".wav")[0])
-    return files
-
-def data_proc(dataset_folder, output_folder, max_duration=179):
+def data_proc(input_json_file_path, output_json_file_path, dataset_folder, max_duration, min_duration):
     """
     Prepare json files for the Pashto speech to french text datatset.
 
@@ -99,24 +78,30 @@ def data_proc(dataset_folder, output_folder, max_duration=179):
         output_folder (str) : path where we save the new json files.
     """
 
-    try:
-        os.mkdir(output_folder)
-    except OSError:
-        print(
-            "Tried to create " + output_folder + ", but folder already exists."
-        )
+    output_json, too_short, too_long = generate_json(dataset_folder, "DW_Pashto.json", max_duration, min_duration)
 
-    for split in ["train", "dev", "test"]:
-        try:
-            output_json, too_short, too_long = generate_json(dataset_folder, split, max_duration)     
-        except FileNotFoundError:
-            print(f"Could not find description file for {split} split.")   
-            
-        write_json(os.path.join(output_folder, f"{split}.json"), output_json)
-        
-        if len(too_short) > 0:
-            write_json(os.path.join(output_folder, f"{split}_bad_segments_short.json"), too_short)
-        
-        if len(too_long) > 0:
-            write_json(os.path.join(output_folder, f"{split}_bad_segments_long.json"), too_long)
+    write_json(output_json_file_path, output_json)
 
+    base_file_name = output_json_file_path.split('.json')[0]
+    if len(too_short) > 0:
+        write_json(base_file_name + "_bad_segments_short.json", too_short)
+
+    if len(too_long) > 0:
+        write_json(base_file_name + "_bad_segments_long.json", too_long)
+
+
+if __name__ == "__main__":
+    # Load hyperparameters file with command-line overrides
+    hparams_file, run_opts, overrides = sb.parse_arguments(sys.argv[1:])
+    with open(hparams_file) as fin:
+        hparams = load_hyperpyyaml(fin, overrides)
+
+        # creates a logger
+    logger = logging.getLogger(__name__)
+    data_proc(
+        input_json_file_path=hparams["unprepared_train_json_file"],
+        output_json_file_path=hparams["train_json"],
+        dataset_folder=hparams["unlabelled_data_folder"],
+        max_duration=hparams["avoid_if_longer_than"],
+        min_duration=hparams["avoid_if_shorter_than"]
+    )

@@ -1,6 +1,6 @@
 # ############################################################################
-# Model: E2E ST with wav2vec 2.0 encoder
-# Encoder: wav2vec 2.0 + linear projection
+# Model: E2E ASR with Whisper encoder
+# Encoder: Whisper + linear projection
 # Decoder: Transformer
 # Tokens: unigram (1000)
 # losses: NLL
@@ -8,36 +8,56 @@
 # ############################################################################
 
 # Seed needs to be set at top of yaml, before objects with parameters are made
-seed: 5989
+seed: 10667
 __set_seed: !!python/object/apply:torch.manual_seed [!ref <seed>]
 debug: False
+
+skip_to_test: True
+
 output_folder: !ref output/<seed>
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.log
 
-# yamllint disable-line rule:line-length
+lm_path: !PLACEHOLDER
 max_segment_duration: 179 # Specifies max segment duration: 179 will ignore 2 files, 269 will ignore 1
+min_segment_duration: 1.5
 
-root_data_folder: !PLACEHOLDER
+# Data options
 # data folder is the place where the json files will be stored prior to training
-data_folder: !ref <root_data_folder>/json_prepared_asr
+root_data_folder: !PLACEHOLDER
+data_folder: !ref <root_data_folder>/ST_DW_Pashto
+
+use_scraped_data: False
+unlabelled_data_folder: !PLACEHOLDER
+official_data_folder: !PLACEHOLDER
+unprepared_train_json_file: !ref <unlabelled_data_folder>/all_train.json  # Standard JSON files
+prepared_train_json_for_scraped_data: !ref <data_folder>/all.json
+
+# For dataset inference: eg. Generating Translation for the evaluation dataset
+translate_dataset_json: !PLACEHOLDER
+submissions_folder: !PLACEHOLDER
+translation_file_output: !ref <submissions_folder>/ontrac.st.constrained.contrastive2
+
 lang: "fr" #for the BLEU score detokenization
-vocab_size: 1200 #for SentencePiece tokenizer (unigram)
+vocab_size: 1000 #for SentencePiece tokenizer (unigram)
 
-# URL for the HuggingFace model we want to load (BASE here)
-wav2vec2_hub: ihanif/wav2vec2-xls-r-300m-pashto-lm
+# URL for the HuggingFace model we want to load
+whisper_hub: "openai/whisper-small"
 
-# wav2vec 2.0 specific parameters
-wav2vec2_frozen: False
-# yamllint disable-line rule:line-length
-keep_n_layers: 12 # keep first N layers from the Transformer Encoder stack inside the wav2vec 2.0 model
+# Pre-trained model path (if any)
+asr_model_path: ""
+
+# Whisper specific parameters
+whisper_frozen: False
+keep_n_layers: 12 # keep first N layers from the Transformer Encoder stack inside the whisper model
 
 # Training parameters
 number_of_epochs: 100
-lr: 0.001
-lr_wav2vec: 0.001
-batch_size: 2
+lr: 0.0001
+lr_whisper: 0.000001
+batch_size: 4
 test_batch_size: 4
+
 loss_reduction: batchmean
 ckpt_interval_minutes: 15 # save checkpoint every N min
 
@@ -56,23 +76,26 @@ dataloader_options:
     num_workers: 8
 
 test_dataloader_options:
-    batch_size: !ref <test_batch_size>
-    num_workers: 8
+    batch_size: 8
+    num_workers: 0
 
-# Feature parameters (W2V2 etc)
-features_dim: 1024 #base wav2vec output dimension, for large replace by 1024
+transcribe_dataloader_options:
+    batch_size: 1
+    num_workers: 0
+# Feature parameters (Whisper)
+features_dim: 768 #base whisper output dimension, for medium replace by 1024
 
-#projection for w2v
+#projection for whisper
 enc_dnn_layers: 1
-enc_dnn_neurons: 256
+enc_dnn_neurons: 512
 
 # Transformer
-embedding_size: 256
-d_model: 256
-nhead: 4
-num_decoder_layers: 3
+embedding_size: 512
+d_model: 512
+nhead: 8
+num_decoder_layers: 6
 d_ffn: 1024
-transformer_dropout: 0.1
+transformer_dropout: 0.3
 activation: !name:torch.nn.GELU
 # yamllint disable-line rule:line-length
 output_neurons: !ref <vocab_size> # /!\ needs to be changed accordingly to the vocabulary
@@ -93,12 +116,12 @@ valid_beam_size: 5
 test_beam_size: 5
 
 ############################## models ################################
-#wav2vec model
-wav2vec2: !new:speechbrain.lobes.models.huggingface_wav2vec.HuggingFaceWav2Vec2
-    pretrained_path: !ref <wav2vec2_hub>
-    output_norm: True
-    freeze: !ref <wav2vec2_frozen>
-    save_path: !ref <save_folder>/wav2vec2_checkpoint
+# Whisper encoder
+whisper: !new:speechbrain.lobes.models.huggingface_whisper.HuggingFaceWhisper
+    source: !ref <whisper_hub>
+    freeze: !ref <whisper_frozen>
+    encoder_only: True
+    save_path: !ref <save_folder>/whisper_checkpoint
 
 
 #linear projection
@@ -130,11 +153,16 @@ seq_lin: !new:speechbrain.nnet.linear.Linear
     input_size: !ref <d_model>
     n_neurons: !ref <output_neurons>
 
+# Transformer LM for decoding.
+lm_model: !new:speechbrain.lobes.models.transformer.TransformerLM.TransformerLM
+    vocab: 1000
+
 modules:
-    wav2vec2: !ref <wav2vec2>
+    whisper: !ref <whisper>
     enc: !ref <enc>
     Transformer: !ref <Transformer>
     seq_lin: !ref <seq_lin>
+    lm_model: !ref <lm_model>
 
 model: !new:torch.nn.ModuleList
     - [!ref <enc>, !ref <Transformer>, !ref <seq_lin>]
@@ -142,8 +170,8 @@ model: !new:torch.nn.ModuleList
 adam_opt_class: !name:torch.optim.Adam
     lr: !ref <lr>
 
-wav2vec_opt_class: !name:torch.optim.Adam
-    lr: !ref <lr_wav2vec>
+whisper_opt_class: !name:torch.optim.Adam
+    lr: !ref <lr_whisper>
 
 seq_cost: !name:speechbrain.nnet.losses.nll_loss
     label_smoothing: !ref <label_smoothing>
@@ -155,8 +183,8 @@ lr_annealing_adam: !new:speechbrain.nnet.schedulers.NewBobScheduler
     annealing_factor: 0.5
     patient: 2
 
-lr_annealing_wav2vec: !new:speechbrain.nnet.schedulers.NewBobScheduler
-    initial_value: !ref <lr_wav2vec>
+lr_annealing_whisper: !new:speechbrain.nnet.schedulers.NewBobScheduler
+    initial_value: !ref <lr_whisper>
     improvement_threshold: 0.0025
     annealing_factor: 0.9
 
@@ -164,10 +192,15 @@ checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     checkpoints_dir: !ref <save_folder>
     recoverables:
         model: !ref <model>
-        wav2vec2: !ref <wav2vec2>
+        whisper: !ref <whisper>
         lr_annealing_adam: !ref <lr_annealing_adam>
-        lr_annealing_wav2vec: !ref <lr_annealing_wav2vec>
+        lr_annealing_whisper: !ref <lr_annealing_whisper>
         counter: !ref <epoch_counter>
+
+# Transferring ASR models to ST
+asr_transfer_checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <asr_model_path>
+asr_min_key: "WER"
 
 train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
     save_file: !ref <train_log>
@@ -193,11 +226,21 @@ test_search: !new:speechbrain.decoders.S2STransformerBeamSearch
     beam_size: !ref <test_beam_size>
     using_eos_threshold: True
     length_normalization: True
+    lm_weight: 0.5
+    lm_modules: !ref <lm_model>
+    temperature_lm: 5
+
+
+pretrainer: !new:speechbrain.utils.parameter_transfer.Pretrainer
+    collect_in: !ref <save_folder>
+    loadables:
+        lm: !ref <lm_model>
+    paths:
+        lm: !ref <lm_path>/model.ckpt
 
 # Functions that compute the statistics to track during the validation step.
-error_rate_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
-
-cer_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
-    split_tokens: True
+bleu_computer: !name:speechbrain.utils.bleu.BLEUStats
+    merge_words: False
+    lang: !ref <lang>
 
 acc_computer: !name:speechbrain.utils.Accuracy.AccuracyStats
